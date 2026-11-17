@@ -1,0 +1,7 @@
+fastapi[standard]
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary]
+sse-starlette
+openai
+python-dotenv
