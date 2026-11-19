@@ -45,6 +45,7 @@ class PostgresRiskCheckerAST:
         select_max_limit: int = 1000,
         dml_max_rows_warn_threshold: int = 1000,
         dml_max_rows_critical_threshold: int = 100000,
+        allow_multi_statement: bool = False,  # ✅【新增配置项】是否允许多语句批量执行
     ):
         """
         Postgres SQL风险检查器（仅三档风险：低/中/高）
@@ -53,6 +54,7 @@ class PostgresRiskCheckerAST:
         :param allow_vacuum: 是否允许VACUUM / VACUUM ANALYZE
         :param allow_reindex: 是否允许REINDEX
         :param allow_cluster: 是否允许CLUSTER
+        :param allow_multi_statement: ✅【新增】是否允许多条SQL语句一次性批量执行（多步操作）
         :param business_tables: 业务表列表（仅标记审计）
         :param critical_tables: 核心敏感表（命中告警，不拦截）
         :param forbidden_tables: 禁止操作黑名单表（命中直接拒绝）
@@ -67,6 +69,7 @@ class PostgresRiskCheckerAST:
         self.allow_vacuum = allow_vacuum
         self.allow_reindex = allow_reindex
         self.allow_cluster = allow_cluster
+        self.allow_multi_statement = allow_multi_statement  # ✅【新增】
 
         self.business_tables = set(t.lower() for t in (business_tables or []))
         self.critical_tables = set(t.lower() for t in (critical_tables or []))
@@ -109,6 +112,7 @@ class PostgresRiskCheckerAST:
                 "errors": [],
                 "tables": [],
                 "statements": [],
+                "multi_statement": False,  # ✅【新增返回字段】标记是否多语句
                 "performance_risk": {
                     "risk_level": "low",
                     "estimate_scan_rows": None,
@@ -166,17 +170,31 @@ class PostgresRiskCheckerAST:
         warnings: list[Any] = []
         errors: list[Any] = []
 
+        # ===================== ✅【核心改动：多语句判断逻辑】 =====================
+        has_multi_stmt = len(expressions) > 1
+        if has_multi_stmt:
+            result["data"]["multi_statement"] = True
+            if not self.allow_multi_statement:
+                # 多步操作，直接升级高风险红标
+                overall_risk = "high"
+                overall_desc = "多语句批量执行（多步操作），无法单独回滚、风险不可控"
+                errors.append("禁止一次性执行多条SQL语句（多步操作）")
+                alerts.append("⚠️ 多语句批量执行，高危！")
+        # ========================================================================
+
         for expr in expressions:
             stmt_result = self._analyze_statement(expr)
             statements_info.append(stmt_result)
             for t in stmt_result.get("tables", []):
                 tables.add(t)
-            if (
-                self.RISK_ORDER[stmt_result["risk_level"]]
-                > self.RISK_ORDER[overall_risk]
-            ):
-                overall_risk = stmt_result["risk_level"]
-                overall_desc = stmt_result["risk_desc"]
+            # 只有不是多语句拦截的情况下，才走单语句风险比较
+            if not has_multi_stmt or self.allow_multi_statement:
+                if (
+                    self.RISK_ORDER[stmt_result["risk_level"]]
+                    > self.RISK_ORDER[overall_risk]
+                ):
+                    overall_risk = stmt_result["risk_level"]
+                    overall_desc = stmt_result["risk_desc"]
             alerts.extend(stmt_result.get("alerts", []))
             warnings.extend(stmt_result.get("warnings", []))
             errors.extend(stmt_result.get("errors", []))
@@ -198,7 +216,9 @@ class PostgresRiskCheckerAST:
         result["data"]["overall_risk_level"] = overall_risk
         result["data"]["overall_risk_name"] = self.RISK_LEVEL_MAP[overall_risk]["name"]
         result["data"]["overall_risk_sign"] = self.RISK_LEVEL_MAP[overall_risk]["sign"]
-        result["data"]["risk_desc"] = overall_desc
+        # 如果多语句已经设置了desc，优先保留；否则用单语句的desc
+        if not (has_multi_stmt and not self.allow_multi_statement):
+            result["data"]["risk_desc"] = overall_desc
 
         if errors:
             result["data"]["action"] = "reject"
@@ -467,6 +487,7 @@ class PostgresRiskCheckerAST:
                 "errors": [] if allowed else [f"{desc}，当前环境未允许执行"],
                 "tables": [],
                 "statements": [],
+                "multi_statement": False,  # ✅ 同步补全字段
             },
         }
 
@@ -494,6 +515,7 @@ class PostgresRiskCheckerAST:
             "allow_vacuum": self.allow_vacuum,
             "allow_reindex": self.allow_reindex,
             "allow_cluster": self.allow_cluster,
+            "allow_multi_statement": self.allow_multi_statement,  # ✅ 配置快照新增
             "business_tables": sorted(self.business_tables),
             "critical_tables": sorted(self.critical_tables),
             "forbidden_tables": sorted(self.forbidden_tables),
@@ -516,7 +538,12 @@ if __name__ == "__main__":
         allow_vacuum=False,
         allow_reindex=False,
         allow_cluster=False,
-        business_tables=["user", "order_info"],
+        allow_multi_statement=False,  # ✅ 默认关闭多语句（多步操作拦截）
+        business_tables=[
+            "demo_business.users",
+            "demo_business.orders",
+            "demo_business.articles",
+        ],
         critical_tables=["account", "balance"],
         forbidden_tables=["backup_data"],
         select_scan_rows_warn_threshold=10000,
@@ -525,23 +552,26 @@ if __name__ == "__main__":
     )
 
     test_sqls = [
-        "select * from user limit 100;",
-        "update user set name='a' where id=1;",
-        "update user set name='a';",
-        "delete from order_info;",
-        "vacuum;",
-        "vacuum analyze user;",
-        "reindex user;",
-        "cluster user using idx_user_id;",
-        "copy user to '/tmp/user.csv';",
-        "drop table backup_data;",
-        "alter table user add column age int;",
-        "alter table user rename to user_new;",
-        "begin;",
-        "commit;",
-        "rollback;",
-        "savepoint sp1;",
-        "explain select * from user;",
+        # "select * from user limit 100;",
+        # "update user set name='a' where id=1;",
+        # "update user set name='a';",
+        # "delete from order_info;",
+        # "vacuum;",
+        # "vacuum analyze user;",
+        # "reindex user;",
+        # "cluster user using idx_user_id;",
+        # "copy user to '/tmp/user.csv';",
+        # "drop table backup_data;",
+        # "alter table user add column age int;",
+        # "alter table user rename to user_new;",
+        # "begin;",
+        # "commit;",
+        # "rollback;",
+        # "savepoint sp1;",
+        # "explain select * from user;",
+        # # ✅ 新增多语句测试用例
+        # "select * from user limit 10; update user set name='test' where id=1;",
+        "DROP TABLE IF EXISTS demo_business.users;"
     ]
     for s in test_sqls:
         print("=" * 90)

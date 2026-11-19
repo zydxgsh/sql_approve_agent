@@ -7,6 +7,7 @@ from app.db.excuteSql import execute_sql_fun
 from app.utils.clearCheckpoints import clear_thread_checkpoints
 from langgraph.types import interrupt, Command
 from langchain_core.runnables import RunnableConfig
+from app.utils.sqlChangeAnalyzer import SqlChangeAnalyzer
 from typing import Any
 import re
 import json
@@ -31,7 +32,7 @@ def parse_txt(state: AgentState) -> dict[str, Any]:
 
 
 # 根据结构化后的输入生成sql
-def generate_sql(state: AgentState) -> dict[str, str | None]:
+def generate_sql(state: AgentState) -> dict[str, str | None | dict[str, Any]]:
     # 组成语句
     prompt = f"当前用户需求为：{state['input_txt']}\n结构化描述：{state.get('parsed_input',{})}"
     print(f'审批拒绝原因：{state.get("reject_reason","")}')
@@ -43,7 +44,9 @@ def generate_sql(state: AgentState) -> dict[str, str | None]:
         r"^```(?:sql)?\s*|\s*```$", "", sql_chat, flags=re.MULTILINE
     ).strip()
     # 此时已成功生成sql
-    return {"generated_sql": sql_chat, "reject_reason": None}
+    analyzer = SqlChangeAnalyzer()
+    res: dict[str, Any] = analyzer.analyze_sql(sql=sql_chat)
+    return {"generated_sql": sql_chat, "reject_reason": None, "sql_analyze": res}
 
 
 # 定义当前风险
@@ -58,30 +61,25 @@ def risk_evalute(state: AgentState) -> dict[str, str]:
             "demo_business.articles",
         ]
     )
-    check_result = checker.check(sql)
     if not sql:
         level, reason = "yellow", "sql为空，无法进行规则校验"
         return {"risk_level": level, "risk_reason": reason}
+    check_result = checker.check(sql)
     check_code = check_result["code"]
-    check_data = check_result["data"]
+    check_data = check_result.get("data", {})
+
+    # 500：解析异常，不走风险等级
     if check_code == 500:
         level, reason = "yellow", "sql语句解析出错"
-    elif check_code == 403:
-        level, reason = "yellow", check_data["risk_desc"]
-    elif check_code == 200:
-        check_action = check_data["action"]
-        check_desc = check_data["risk_desc"]
-        if check_action == "reject":
-            level, reason = "red", check_desc
-        elif check_action == "review":
-            level, reason = "yellow", check_desc
-        else:
-            level, reason = "green", check_desc
     else:
-        level, reason = (
-            "yellow",
-            f'未知风险，返回code为{check_code},{check_data.get("message","")}',
-        )
+        # 解析成功，统一用 overall_risk_level 判定
+        overall_level = check_data.get("overall_risk_level", "low")
+        risk_desc = check_data.get("risk_desc", "无风险")
+        # 映射关系
+        level_map = {"high": "red", "medium": "yellow", "low": "green"}
+        level = level_map.get(overall_level, "yellow")
+        reason = risk_desc
+
     return {"risk_level": level, "risk_reason": reason}
 
 
@@ -120,6 +118,7 @@ def approval_node(state: AgentState, config: RunnableConfig) -> Command[str]:
                 "generated_sql": None,
                 "risk_level": None,
                 "risk_evalute": None,
+                "sql_analyze": None,
             },
         )
 

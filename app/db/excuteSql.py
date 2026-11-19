@@ -30,7 +30,7 @@ def execute_sql_fun(sql: str | None) -> dict[str, Any]:
             cursor.execute(stmt)
             rows += cursor.rowcount or 0
         conn.commit()
-        return {"row_effects": rows, "error": None, "code": 1}
+        return {"row_effects": 0 if rows < 0 else rows, "error": None, "code": 1}
     except psycopg.Error as e:
         if conn:
             conn.rollback()

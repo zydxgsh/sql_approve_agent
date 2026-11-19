@@ -220,6 +220,7 @@ async def retry_node(require: Request, req: RetryRequest):
                 "reject_reason": None,
                 "approvval_decision": None,
                 "final_result": None,
+                "sql_analyze": None,
             },
             as_node="parse_node-",
         )
